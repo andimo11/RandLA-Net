@@ -1,0 +1,1 @@
+python -B main_CoSTAR.py --gpu 0 --mode test --test_area 03

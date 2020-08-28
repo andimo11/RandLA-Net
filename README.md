@@ -2,8 +2,7 @@
 [![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/191111236/3d-semantic-segmentation-on-semantickitti)](https://paperswithcode.com/sota/3d-semantic-segmentation-on-semantickitti?p=191111236)
 [![License CC BY-NC-SA 4.0](https://img.shields.io/badge/license-CC4.0-blue.svg)](https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode)
 
-# [Team CoSTAR](https://costar.jpl.nasa.gov/) 
-# DARPA SubT Competition Implementation of RandLA-Net
+# [Team CoSTAR](https://costar.jpl.nasa.gov/) DARPA SubT Competition Implementation of RandLA-Net
 
 ## RandLA-Net: Efficient Semantic Segmentation of Large-Scale Point Clouds (CVPR 2020)
 

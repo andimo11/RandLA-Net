@@ -2,9 +2,9 @@
 [![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/191111236/3d-semantic-segmentation-on-semantickitti)](https://paperswithcode.com/sota/3d-semantic-segmentation-on-semantickitti?p=191111236)
 [![License CC BY-NC-SA 4.0](https://img.shields.io/badge/license-CC4.0-blue.svg)](https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode)
 
-# ** NASA/JPL's Team CoSTAR ** Implementation for the DARPA SubT Competition
+# Team CoSTAR Implementation for the DARPA SubT Competition
 
-# RandLA-Net: Efficient Semantic Segmentation of Large-Scale Point Clouds (CVPR 2020)
+## RandLA-Net: Efficient Semantic Segmentation of Large-Scale Point Clouds (CVPR 2020)
 
 This is the official implementation of **RandLA-Net** (CVPR2020, Oral presentation), a simple and efficient neural architecture for semantic segmentation of large-scale 3D point clouds. For technical details, please refer to:
  

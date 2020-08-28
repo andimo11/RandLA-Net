@@ -1,0 +1,49 @@
+# This file is covered by the LICENSE file in the root of this project.
+labels: 
+  0: "cave"
+  50: "survivor"
+  60: "backpack"
+  70: "fire_extinguisher"
+  80: "helmet"
+  259: "unlabeled"
+
+color_map: # bgr
+  0 : [0, 0, 0]
+  50: [0, 200, 255]
+  60: [170, 255, 150]
+  70: [0, 175, 0]
+  80: [255, 0, 0]
+content: # as a ratio with the total number of points
+  0: 0.99833442947
+  50: 0.00129376528
+  60: 0.00033796881
+  70: 6.48331661e-09
+  80: 0.00003382994
+# # classes that are indistinguishable from single scan or inconsistent in
+# # ground truth are mapped to their closest equivalent
+learning_map:
+  0 : 0     # "cave"
+  50: 1    # "survivor"
+  60: 2     # "backpack" 
+  70: 3    # "extinguisher"
+  80: 4    # "helmet"
+  259: 5    # "moving-other"-vehicle to "other-vehicle" ----------------mapped
+learning_map_inv: # inverse of previous map
+  0: 0      # "cave", and others ignored
+  1: 50    # "survivor"
+  2: 60    # "backpack"
+  3: 70    # "extinguisher"
+  4: 80    # "helmet"
+learning_ignore: # Ignore classes
+  0: False      # "cave", and others ignored
+  1: False     # "survivor"
+  2: False     # "backpack"
+  3: False     # "extinguisher"
+  4: False     # "helmet"
+split: # sequence numbers
+  train:
+    - 1
+  valid:
+    - 2
+  test:
+    - 3

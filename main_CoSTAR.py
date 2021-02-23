@@ -1,235 +1,291 @@
-from helper_tool import DataProcessing as DP
-from helper_tool import ConfigCoSTAR as cfg
-from helper_tool import Plot
+from open3d import linux as open3d
 from os.path import join
-from RandLANet import Network
-from tester_CoSTAR import ModelTester
-import tensorflow as tf
 import numpy as np
-import os, argparse, pickle
-from sklearn.neighbors import KDTree
+import colorsys, random, os, sys
+import pandas as pd
+import h5py
+
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+sys.path.append(BASE_DIR)
+sys.path.append(os.path.join(BASE_DIR, 'utils'))
+
+import cpp_wrappers.cpp_subsampling.grid_subsampling as cpp_subsampling
+import nearest_neighbors.lib.python.nearest_neighbors as nearest_neighbors
 
 
-class SemanticCoSTAR:
-    def __init__(self, test_id):
-        self.name = 'SemanticCoSTAR'
-        self.dataset_path = '/home/andimo/Desktop/costar/sequences_0.06'
-        self.label_to_names = {
-                            0: 'null',
-                            1: 'survivor',
-                            2: 'backpack',
-                            3: 'extinguisher',
-                            4: 'helmet',
-                            5: 'cave'}
-        self.num_classes = len(self.label_to_names)
-        self.label_values = np.sort([k for k, v in self.label_to_names.items()])
-        self.label_to_idx = {l: i for i, l in enumerate(self.label_values)}
-        self.ignored_labels = np.sort([0])
+class ConfigCoSTAR: #ref main
+    k_n = 16  # KNN
+    num_layers = 4  # Number of layers
+    num_points = 7680   # Number of input points
+    num_classes = 2  # Number of valid classes
+    sub_grid_size = 0.06  # preprocess_parameter    
 
-        self.val_split = '02'
+    batch_size = 6  # batch_size during training
+    val_batch_size = 20  # batch_size during validation and test
+    train_steps = 1  # Number of steps per epochs
+    val_steps = 1  # Number of validation steps per epoch
 
-        self.seq_list = np.sort(os.listdir(self.dataset_path))
-        self.test_scan_number = str(test_id)
-        self.train_list, self.val_list, self.test_list = DP.get_file_list(self.dataset_path, self.test_scan_number)
-        self.train_list = DP.shuffle_list(self.train_list)
-        self.val_list = DP.shuffle_list(self.val_list)
+    sub_sampling_ratio = [4, 4, 4, 4]  # sampling ratio of random sampling at each layer
+    d_out = [16, 64, 128, 256]  # feature dimension
+    num_sub_points = [num_points // 4, num_points // 16, num_points // 64, num_points // 256]
 
-        self.possibility = []
-        self.min_possibility = []
+    noise_init = 3.5  # noise initial parameter
+    max_epoch = 10  # maximum epoch during training
+    learning_rate = 1e-2  # initial learning rate
+    lr_decays = {i: 0.95 for i in range(0, 500)}  # decay rate of learning rate
 
-    # Generate the input data flow
-    def get_batch_gen(self, split):
-        if split == 'training':
-            num_per_epoch = int(len(self.train_list) / cfg.batch_size) * cfg.batch_size
-            path_list = self.train_list
-        elif split == 'validation':
-            num_per_epoch = int(len(self.val_list) / cfg.val_batch_size) * cfg.val_batch_size
-            cfg.val_steps = int(len(self.val_list) / cfg.batch_size)
-            path_list = self.val_list
-        elif split == 'test':
-            num_per_epoch = int(len(self.test_list) / cfg.val_batch_size) * cfg.val_batch_size * 4
-            path_list = self.test_list
-            for test_file_name in path_list:
-                points = np.load(test_file_name)
-                self.possibility += [np.random.rand(points.shape[0]) * 1e-3]
-                self.min_possibility += [float(np.min(self.possibility[-1]))]
+    train_sum_dir = 'train_log'
+    saving = True
+    saving_path = None
 
-        def spatially_regular_gen():
-            # Generator loop
-            for i in range(num_per_epoch):
-                if split != 'test':
-                    cloud_ind = i
-                    pc_path = path_list[cloud_ind]
-                    pc, tree, labels = self.get_data(pc_path)
-                    # crop a small point cloud
-                    pick_idx = np.random.choice(len(pc), 1)
-                    selected_pc, selected_labels, selected_idx = self.crop_pc(pc, labels, tree, pick_idx)
+def read_pc(filepath):
+    """ Read PointCloud data from a numpy bin/pickle."""
+    f = h5py.File(filepath, 'r')
+    pc = f['pointcloud']
+    return pc
+
+class DataProcessing:
+    @staticmethod
+    def load_pc_costar(pc_path):
+        scan = read_pc(pc_path)
+        size = int(scan.size)
+        point_cloud = np.empty(shape=[size,3])
+        point_cloud[:,0] = scan['x']
+        point_cloud[:,1] = scan['y']
+        point_cloud[:,2] = scan['z']
+        return point_cloud.astype(np.float32)
+
+    @staticmethod
+    def load_label_costar(label_path):
+        scan = read_pc(label_path)
+        size = int(scan.size)
+        label = np.zeros(shape=[size])
+        label = scan['intensity']
+        label[label == 0] = 1   
+        label[label == 50] = 2
+        label[label == 60] = 1
+        label[label == 70] = 1
+        label[label == 80] = 1
+        return label.astype(np.int32)
+
+    @staticmethod
+    def load_pc_kitti(pc_path):
+        scan = np.fromfile(pc_path, dtype=np.float32)
+        scan = scan.reshape((-1, 4))
+        points = scan[:, 0:3]  # get xyz
+        return points
+
+    @staticmethod
+    def load_label_kitti(label_path, remap_lut):
+        label = np.fromfile(label_path, dtype=np.uint32)
+        label = label.reshape((-1))
+        sem_label = label & 0xFFFF  # semantic label in lower half
+        inst_label = label >> 16  # instance id in upper half
+        assert ((sem_label + (inst_label << 16) == label).all())
+        sem_label = remap_lut[sem_label]
+        return sem_label.astype(np.int32)
+
+    @staticmethod
+    def get_file_list(dataset_path, test_scan_num):
+
+        seq_list = np.sort(os.listdir(dataset_path))
+        
+        train_file_list = []
+        test_file_list = []
+        val_file_list = []
+        for seq_id in seq_list:
+            seq_path = join(dataset_path, seq_id)
+            pc_path = join(seq_path, 'velodyne')
+            if int(seq_id) == 2:
+                val_file_list.append([join(pc_path, f) for f in np.sort(os.listdir(pc_path))])
+                if seq_id == test_scan_num:
+                    test_file_list.append([join(seq_id, f) for f in np.sort(os.listdir(pc_path))])
+            elif int(seq_id) == 3 and seq_id == test_scan_num:
+                test_file_list.append([join(pc_path, f) for f in np.sort(os.listdir(pc_path))])
+            elif int(seq_id) == 1:
+                train_file_list.append([join(pc_path, f) for f in np.sort(os.listdir(pc_path))])
+        train_file_list = np.concatenate(train_file_list, axis=0)
+        val_file_list = np.concatenate(val_file_list, axis=0)
+        test_file_list = np.concatenate(test_file_list, axis=0)
+
+        return train_file_list, val_file_list, test_file_list
+
+    @staticmethod
+    def knn_search(support_pts, query_pts, k):
+        """
+        :param support_pts: points you have, B*N1*3
+        :param query_pts: points you want to know the neighbour index, B*N2*3
+        :param k: Number of neighbours in knn search
+        :return: neighbor_idx: neighboring points indexes, B*N2*k
+        """
+
+        neighbor_idx = nearest_neighbors.knn_batch(support_pts, query_pts, k, omp=True)
+        return neighbor_idx.astype(np.int32)
+
+    @staticmethod
+    def data_aug(xyz, color, labels, idx, num_out):
+        num_in = len(xyz)
+        dup = np.random.choice(num_in, num_out - num_in)
+        xyz_dup = xyz[dup, ...]
+        xyz_aug = np.concatenate([xyz, xyz_dup], 0)
+        color_dup = color[dup, ...]
+        color_aug = np.concatenate([color, color_dup], 0)
+        idx_dup = list(range(num_in)) + list(dup)
+        idx_aug = idx[idx_dup]
+        label_aug = labels[idx_dup]
+        return xyz_aug, color_aug, idx_aug, label_aug
+
+    @staticmethod
+    def shuffle_idx(x):
+        # random shuffle the index
+        idx = np.arange(len(x))
+        np.random.shuffle(idx)
+        return x[idx]
+
+    @staticmethod
+    def shuffle_list(data_list):
+        indices = np.arange(np.shape(data_list)[0])
+        np.random.shuffle(indices)
+        data_list = data_list[indices]
+        return data_list
+
+    @staticmethod
+    def grid_sub_sampling(points, features=None, labels=None, grid_size=0.1, verbose=0):
+        """
+        CPP wrapper for a grid sub_sampling (method = barycenter for points and features
+        :param points: (N, 3) matrix of input points
+        :param features: optional (N, d) matrix of features (floating number)
+        :param labels: optional (N,) matrix of integer labels
+        :param grid_size: parameter defining the size of grid voxels
+        :param verbose: 1 to display
+        :return: sub_sampled points, with features and/or labels depending of the input
+        """
+
+        if (features is None) and (labels is None):
+            return cpp_subsampling.compute(points, sampleDl=grid_size, verbose=verbose)
+        elif labels is None:
+            return cpp_subsampling.compute(points, features=features, sampleDl=grid_size, verbose=verbose)
+        elif features is None:
+            return cpp_subsampling.compute(points, classes=labels, sampleDl=grid_size, verbose=verbose)
+        else:
+            return cpp_subsampling.compute(points, features=features, classes=labels, sampleDl=grid_size,
+                                           verbose=verbose)
+
+    @staticmethod
+    def IoU_from_confusions(confusions):
+        """
+        Computes IoU from confusion matrices.
+        :param confusions: ([..., n_c, n_c] np.int32). Can be any dimension, the confusion matrices should be described by
+        the last axes. n_c = number of classes
+        :return: ([..., n_c] np.float32) IoU score
+        """
+
+        # Compute TP, FP, FN. This assume that the second to last axis counts the truths (like the first axis of a
+        # confusion matrix), and that the last axis counts the predictions (like the second axis of a confusion matrix)
+        TP = np.diagonal(confusions, axis1=-2, axis2=-1)
+        TP_plus_FN = np.sum(confusions, axis=-1)
+        TP_plus_FP = np.sum(confusions, axis=-2)
+
+        # Compute IoU
+        IoU = TP / (TP_plus_FP + TP_plus_FN - TP + 1e-6)
+
+        # Compute mIoU with only the actual classes
+        mask = TP_plus_FN < 1e-3
+        counts = np.sum(1 - mask, axis=-1, keepdims=True)
+        mIoU = np.sum(IoU, axis=-1, keepdims=True) / (counts + 1e-6)
+
+        # If class is absent, place mIoU in place of 0 IoU to get the actual mean later
+        IoU += mask * mIoU
+        return IoU
+
+    @staticmethod
+    def get_class_weights(dataset_name):
+        # pre-calculate the number of points in each category
+        num_per_class = []
+        if dataset_name is 'S3DIS':
+            num_per_class = np.array([3370714, 2856755, 4919229, 318158, 375640, 478001, 974733,
+                                      650464, 791496, 88727, 1284130, 229758, 2272837], dtype=np.int32)
+        elif dataset_name is 'Semantic3D':
+            num_per_class = np.array([5181602, 5012952, 6830086, 1311528, 10476365, 946982, 334860, 269353],
+                                     dtype=np.int32)
+        elif dataset_name is 'SemanticKITTI':
+            num_per_class = np.array([55437630, 320797, 541736, 2578735, 3274484, 552662, 184064, 78858,
+                                      240942562, 17294618, 170599734, 6369672, 230413074, 101130274, 476491114,
+                                      9833174, 129609852, 4506626, 1168181])
+        elif dataset_name is 'SemanticCoSTAR':
+            num_per_class = np.array([153985142, 199553])
+        weight = num_per_class / float(sum(num_per_class))
+        ce_label_weight = 1 / (weight + 0.02)
+        return np.expand_dims(ce_label_weight, axis=0)
+
+
+class Plot:
+    @staticmethod
+    def random_colors(N, bright=True, seed=0):
+        brightness = 1.0 if bright else 0.7
+        hsv = [(0.15 + i / float(N), 1, brightness) for i in range(N)]
+        colors = list(map(lambda c: colorsys.hsv_to_rgb(*c), hsv))
+        random.seed(seed)
+        random.shuffle(colors)
+        return colors
+
+    @staticmethod
+    def draw_pc(pc_xyzrgb):
+        pc = open3d.PointCloud()
+        pc.points = open3d.Vector3dVector(pc_xyzrgb[:, 0:3])
+        if pc_xyzrgb.shape[1] == 3:
+            open3d.draw_geometries([pc])
+            return 0
+        if np.max(pc_xyzrgb[:, 3:6]) > 20:  ## 0-255
+            pc.colors = open3d.Vector3dVector(pc_xyzrgb[:, 3:6] / 255.)
+        else:
+            pc.colors = open3d.Vector3dVector(pc_xyzrgb[:, 3:6])
+        open3d.draw_geometries([pc])
+        return 0
+
+    @staticmethod
+    def draw_pc_sem_ins(pc_xyz, pc_sem_ins, plot_colors=None):
+        """
+        pc_xyz: 3D coordinates of point clouds
+        pc_sem_ins: semantic or instance labels
+        plot_colors: custom color list
+        """
+        if plot_colors is not None:
+            ins_colors = plot_colors
+        else:
+            ins_colors = Plot.random_colors(len(np.unique(pc_sem_ins)) + 1, seed=2)
+
+        ##############################
+        sem_ins_labels = np.unique(pc_sem_ins)
+        sem_ins_bbox = []
+        Y_colors = np.zeros((pc_sem_ins.shape[0], 3))
+        for id, semins in enumerate(sem_ins_labels):
+            valid_ind = np.argwhere(pc_sem_ins == semins)[:, 0]
+            if semins <= -1:
+                tp = [0, 0, 0]
+            else:
+                if plot_colors is not None:
+                    tp = ins_colors[semins]
                 else:
-                    cloud_ind = int(np.argmin(self.min_possibility))
-                    pick_idx = np.argmin(self.possibility[cloud_ind])
-                    pc_path = path_list[cloud_ind]
-                    pc, tree, labels = self.get_data(pc_path)
-                    selected_pc, selected_labels, selected_idx = self.crop_pc(pc, labels, tree, pick_idx)
+                    tp = ins_colors[id]
 
-                    # update the possibility of the selected pc
-                    dists = np.sum(np.square((selected_pc - pc[pick_idx]).astype(np.float32)), axis=1)
-                    delta = np.square(1 - dists / np.max(dists))
-                    self.possibility[cloud_ind][selected_idx] += delta
-                    self.min_possibility[cloud_ind] = np.min(self.possibility[cloud_ind])
+            Y_colors[valid_ind] = tp
 
-                if True:
-                    yield (selected_pc.astype(np.float32),
-                           selected_labels.astype(np.int32),
-                           selected_idx.astype(np.int32),
-                           np.array([cloud_ind], dtype=np.int32))
+            ### bbox
+            valid_xyz = pc_xyz[valid_ind]
 
-        gen_func = spatially_regular_gen
-        gen_types = (tf.float32, tf.int32, tf.int32, tf.int32)
-        gen_shapes = ([None, 3], [None], [None], [None])
+            xmin = np.min(valid_xyz[:, 0]);
+            xmax = np.max(valid_xyz[:, 0])
+            ymin = np.min(valid_xyz[:, 1]);
+            ymax = np.max(valid_xyz[:, 1])
+            zmin = np.min(valid_xyz[:, 2]);
+            zmax = np.max(valid_xyz[:, 2])
+            sem_ins_bbox.append(
+                [[xmin, ymin, zmin], [xmax, ymax, zmax], [min(tp[0], 1.), min(tp[1], 1.), min(tp[2], 1.)]])
 
-        return gen_func, gen_types, gen_shapes
-
-    def get_data(self, file_path):
-        seq_id = file_path.split('/')[-3]
-        frame_id = file_path.split('/')[-1][:-4]
-        kd_tree_path = join(self.dataset_path, seq_id, 'KDTree', frame_id + '.pkl')
-        # Read pkl with search tree
-        with open(kd_tree_path, 'rb') as f:
-            search_tree = pickle.load(f)
-        points = np.array(search_tree.data, copy=False)
-    
-        if int(seq_id) == 3:
-            labels = np.zeros(np.shape(points)[0], dtype=np.uint8)
-        else:
-            label_path = join(self.dataset_path, seq_id, 'labels', frame_id + '.npy')
-            labels = np.squeeze(np.load(label_path))
-
-        return points, search_tree, labels
-
-    @staticmethod
-    def crop_pc(points, labels, search_tree, pick_idx):    
-        # crop a fixed size point cloud for training
-        center_point = points[pick_idx, :].reshape(1, -1)
-        select_idx = search_tree.query(center_point, k=cfg.num_points)[1][0]
-        select_idx = DP.shuffle_idx(select_idx)
-        select_points = points[select_idx]
-        select_labels = labels[select_idx]
-        return select_points, select_labels, select_idx
-
-    @staticmethod
-    def get_tf_mapping2():
-
-        def tf_map(batch_pc, batch_label, batch_pc_idx, batch_cloud_idx):
-            features = batch_pc
-            input_points = []
-            input_neighbors = []
-            input_pools = []
-            input_up_samples = []
-
-            for i in range(cfg.num_layers):
-                neighbour_idx = tf.py_func(DP.knn_search, [batch_pc, batch_pc, cfg.k_n], tf.int32)
-                sub_points = batch_pc[:, :tf.shape(batch_pc)[1] // cfg.sub_sampling_ratio[i], :]
-                pool_i = neighbour_idx[:, :tf.shape(batch_pc)[1] // cfg.sub_sampling_ratio[i], :]
-                up_i = tf.py_func(DP.knn_search, [sub_points, batch_pc, 1], tf.int32)
-                input_points.append(batch_pc)
-                input_neighbors.append(neighbour_idx)
-                input_pools.append(pool_i)
-                input_up_samples.append(up_i)
-                batch_pc = sub_points
-
-            input_list = input_points + input_neighbors + input_pools + input_up_samples
-            input_list += [features, batch_label, batch_pc_idx, batch_cloud_idx]
-
-            return input_list
-
-        return tf_map
-
-#check this
-    def init_input_pipeline(self):
-        print('Initiating input pipelines')
-        cfg.ignored_label_inds = [self.label_to_idx[ign_label] for ign_label in self.ignored_labels]
-        gen_function, gen_types, gen_shapes = self.get_batch_gen('training')
-        gen_function_val, _, _ = self.get_batch_gen('validation')
-        gen_function_test, _, _ = self.get_batch_gen('test')
-
-        self.train_data = tf.data.Dataset.from_generator(gen_function, gen_types, gen_shapes)
-        self.val_data = tf.data.Dataset.from_generator(gen_function_val, gen_types, gen_shapes)
-        self.test_data = tf.data.Dataset.from_generator(gen_function_test, gen_types, gen_shapes)
-
-        self.batch_train_data = self.train_data.batch(cfg.batch_size)
-        self.batch_val_data = self.val_data.batch(cfg.val_batch_size)
-        self.batch_test_data = self.test_data.batch(cfg.val_batch_size)
-
-        map_func = self.get_tf_mapping2()
-
-        self.batch_train_data = self.batch_train_data.map(map_func=map_func)
-        self.batch_val_data = self.batch_val_data.map(map_func=map_func)
-        self.batch_test_data = self.batch_test_data.map(map_func=map_func)
-
-        self.batch_train_data = self.batch_train_data.prefetch(cfg.batch_size)
-        self.batch_val_data = self.batch_val_data.prefetch(cfg.val_batch_size)
-        self.batch_test_data = self.batch_test_data.prefetch(cfg.val_batch_size)
-
-        #print these
-        # print(self.batch_train_data.output_types)
-        # print(self.batch_train_data.output_shapes)
-        # raise EnvironmentError
-        #look into droping batches if too small
-        iter = tf.data.Iterator.from_structure(self.batch_train_data.output_types, self.batch_train_data.output_shapes)
-        self.flat_inputs = iter.get_next()
-        self.train_init_op = iter.make_initializer(self.batch_train_data)
-        self.val_init_op = iter.make_initializer(self.batch_val_data)
-        self.test_init_op = iter.make_initializer(self.batch_test_data)
-
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--gpu', type=int, default=0, help='the number of GPUs to use [default: 0]')
-    parser.add_argument('--mode', type=str, default='train', help='options: train, test, vis')
-    parser.add_argument('--test_area', type=str, default='03', help='options: 03')
-    parser.add_argument('--model_path', type=str, default='None', help='pretrained model path')
-    FLAGS = parser.parse_args()
-
-    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(FLAGS.gpu)
-    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-    Mode = FLAGS.mode
-
-    test_area = FLAGS.test_area
-    dataset = SemanticCoSTAR(test_area)
-
-    dataset.init_input_pipeline()
-
-    if Mode == 'train':
-        model = Network(dataset, cfg)
-        model.train(dataset)
-    elif Mode == 'test':
-        cfg.saving = False
-        model = Network(dataset, cfg)
-        if FLAGS.model_path is not 'None':
-            chosen_snap = FLAGS.model_path
-        else:
-            chosen_snapshot = -1
-            logs = np.sort([os.path.join('results', f) for f in os.listdir('results') if f.startswith('Log')])
-            chosen_folder = logs[-1]
-            snap_path = join(chosen_folder, 'snapshots')
-            snap_steps = [int(f[:-5].split('-')[-1]) for f in os.listdir(snap_path) if f[-5:] == '.meta']
-            chosen_step = np.sort(snap_steps)[-1]
-            chosen_snap = os.path.join(snap_path, 'snap-{:d}'.format(chosen_step))
-        tester = ModelTester(model, dataset, restore_snap=chosen_snap)
-        tester.test(model, dataset)
-    else:
-        ##################
-        # Visualize data #
-        ##################
-
-        with tf.Session() as sess:
-            sess.run(tf.global_variables_initializer())
-            sess.run(dataset.train_init_op)
-            while True:
-                flat_inputs = sess.run(dataset.flat_inputs)
-                pc_xyz = flat_inputs[0]
-                sub_pc_xyz = flat_inputs[1]
-                labels = flat_inputs[17]
-                Plot.draw_pc_sem_ins(pc_xyz[0, :, :], labels[0, :])
-                Plot.draw_pc_sem_ins(sub_pc_xyz[0, :, :], labels[0, 0:np.shape(sub_pc_xyz)[1]])
+        Y_semins = np.concatenate([pc_xyz[:, 0:3], Y_colors], axis=-1)
+        Plot.draw_pc(Y_semins)
+        return Y_semins
